@@ -1,6 +1,7 @@
 plugins {
     id 'idea'
     id 'java-library'
+    id 'org.jetbrains.kotlin.jvm' version '2.1.21'
     id 'maven-publish'
     id 'net.neoforged.moddev' version '2.0.95'
 }
@@ -28,6 +29,13 @@ allprojects {
             }
         }
         mavenCentral()
+        mavenLocal()
+        // REQUIRED for using Kotlin for Forge
+        maven {
+            name = 'Kotlin for Forge'
+            url = 'https://thedarkcolour.github.io/KotlinForForge/'
+            content { includeGroup "thedarkcolour" }
+        }
     }
 }
 
@@ -119,6 +127,7 @@ configurations {
     implementation.extendsFrom library
 }
 
+
 dependencies {
     // Example mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
@@ -142,6 +151,7 @@ dependencies {
     // http://www.gradle.org/docs/current/userguide/dependency_management.html
     // Archipelago Client Java Library
     jarJar project(path: ':client', configuration: 'shadow')
+    library 'thedarkcolour:kotlinforforge-neoforge:5.8.0'
     library project(path: ':client')
 }
 
@@ -153,6 +163,7 @@ var generateModMetadata = tasks.register("generateModMetadata", ProcessResources
             minecraft_version_range: minecraft_version_range,
             neo_version            : neo_version,
             neo_version_range      : neo_version_range,
+            loader                 : loader,
             loader_version_range   : loader_version_range,
             mod_id                 : mod_id,
             mod_name               : mod_name,

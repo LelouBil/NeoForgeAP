@@ -81,6 +81,7 @@ public class APRandomizer {
     static private BlockPos jailCenter = BlockPos.ZERO;
     @Nullable
     static private WorldData worldData;
+    public static GiftHandler giftHandler;
 
     static {
         Gson gson = new Gson();
@@ -141,6 +142,7 @@ public class APRandomizer {
     public static void registerDataMapTypes(RegisterDataMapTypesEvent event) {
         event.register(APDataMaps.DEFAULT_STRUCTURE_BIOMES);
     }
+
     @Nullable
     public static APClient getAP() {
         return APClient;
@@ -161,7 +163,7 @@ public class APRandomizer {
     }
 
     @Nullable
-    public static MinecraftServer getServer(){
+    public static MinecraftServer getServer() {
         return server;
     }
 
@@ -205,6 +207,10 @@ public class APRandomizer {
     @Nullable
     public static WorldData getWorldData() {
         return worldData;
+    }
+
+    public static GiftHandler getGiftHandler() {
+        return giftHandler;
     }
 
     @SubscribeEvent
@@ -309,12 +315,14 @@ public class APRandomizer {
 
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
+        giftHandler.closeGiftBox();
         if (APClient != null)
             APClient.close();
     }
 
     @SubscribeEvent
     public void onServerStopped(ServerStoppedEvent event) {
+        giftHandler.closeGiftBox();
         if (APClient != null)
             APClient.close();
     }

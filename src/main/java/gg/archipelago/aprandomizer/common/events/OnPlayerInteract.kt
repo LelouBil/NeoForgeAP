@@ -1,97 +1,92 @@
-package gg.archipelago.aprandomizer.common.events;
+package gg.archipelago.aprandomizer.common.events
 
-import gg.archipelago.aprandomizer.APRandomizer;
-import gg.archipelago.aprandomizer.attachments.APAttachmentTypes;
-import gg.archipelago.aprandomizer.items.CompassReward;
-import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager;
-import net.minecraft.core.HolderLookup;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtOps;
-import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.item.component.CustomData;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.BlockState;
-import net.neoforged.bus.api.ICancellableEvent;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
-
-import java.util.List;
-import java.util.Optional;
+import gg.archipelago.aprandomizer.APRandomizer
+import gg.archipelago.aprandomizer.attachments.APAttachmentTypes
+import gg.archipelago.aprandomizer.attachments.APPlayerAttachment
+import gg.archipelago.aprandomizer.items.CompassReward
+import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager
+import net.minecraft.core.HolderLookup
+import net.minecraft.core.component.DataComponents
+import net.minecraft.nbt.NbtOps
+import net.minecraft.nbt.Tag
+import net.minecraft.server.level.ServerPlayer
+import net.minecraft.world.item.Items
+import net.minecraft.world.item.component.CustomData
+import net.minecraft.world.level.block.Blocks
+import net.neoforged.bus.api.ICancellableEvent
+import net.neoforged.bus.api.SubscribeEvent
+import net.neoforged.fml.common.EventBusSubscriber
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent
+import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.*
 
 @EventBusSubscriber
-public class OnPlayerInteract {
-
-    static void onPlayerInteract(PlayerInteractEvent event) {
-        if (event.getSide().isClient())
-            return;
+object OnPlayerInteract {
+    fun onPlayerInteract(event: PlayerInteractEvent) {
+        if (event.getSide().isClient()) return
         //stop all right click interactions if game has not started.
-        if (APRandomizer.isJailPlayers() && event instanceof ICancellableEvent cancellable)
-            cancellable.setCanceled(true);
+        if (APRandomizer.isJailPlayers() && event is ICancellableEvent) event.setCanceled(true)
     }
 
     @SubscribeEvent
-    static void onLeftClickBlock(PlayerInteractEvent.LeftClickBlock event) {
-        onPlayerInteract(event);
+    fun onLeftClickBlock(event: LeftClickBlock) {
+        onPlayerInteract(event)
     }
 
     @SubscribeEvent
-    static void onPlayerBlockInteract(PlayerInteractEvent.RightClickBlock event) {
-        onPlayerInteract(event);
+    fun onPlayerBlockInteract(event: RightClickBlock) {
+        onPlayerInteract(event)
 
-        if (event.getSide().isClient())
-            return;
+        if (event.getSide().isClient()) return
 
-        if (!event.getItemStack().has(DataComponents.CUSTOM_DATA) || !event.getItemStack().getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag().contains("structure"))
-            return;
+        if (!event.getItemStack().has(DataComponents.CUSTOM_DATA) || !event.getItemStack()
+                .getOrDefault<CustomData?>(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag().contains("structure")
+        ) return
 
-        BlockState block = event.getLevel().getBlockState(event.getHitVec().getBlockPos());
-        if (block.is(Blocks.LODESTONE))
-            event.setCanceled(true);
+        val block = event.getLevel().getBlockState(event.getHitVec().getBlockPos())
+        if (block.`is`(Blocks.LODESTONE)) event.setCanceled(true)
 
-        event.getEntity().getInventory().setChanged();
-        event.getEntity().inventoryMenu.broadcastChanges();
+        event.getEntity().getInventory().setChanged()
+        event.getEntity().inventoryMenu.broadcastChanges()
     }
 
     @SubscribeEvent
-    static void onPlayerInteractEvent(PlayerInteractEvent.RightClickItem event) {
-        onPlayerInteract(event);
+    fun onPlayerInteractEvent(event: RightClickItem) {
+        onPlayerInteract(event)
 
-        if (event.getSide().isClient())
-            return;
-        if (!(event.getEntity() instanceof ServerPlayer player))
-            return;
+        if (event.getSide().isClient()) return
+        val player = event.getEntity()
+        if (player !is ServerPlayer) return
 
-        if (!event.getItemStack().getItem().equals(Items.COMPASS))
-            return;
+        if (event.getItemStack().getItem() != Items.COMPASS) return
 
-        ItemStack compass = event.getItemStack();
-        CustomData customData = compass.get(DataComponents.CUSTOM_DATA);
-        if (customData == null) return;
+        val compass = event.getItemStack()
+        val customData = compass.get<CustomData?>(DataComponents.CUSTOM_DATA)
+        if (customData == null) return
 
-        CompoundTag nbt = customData.copyTag();
+        val nbt = customData.copyTag()
 
         //fetch our current compass list.
-        List<CompassReward> compasses = event.getEntity().getData(APAttachmentTypes.AP_PLAYER).getUnlockedCompassRewards();
+        val compasses =
+            event.getEntity().getData<APPlayerAttachment?>(APAttachmentTypes.AP_PLAYER).getUnlockedCompassRewards()
 
-        HolderLookup.Provider registries = event.getLevel().registryAccess();
-        Optional<CompassReward> currentCompassReward = nbt.read("structure", CompassReward.CODEC, registries.createSerializationContext(NbtOps.INSTANCE));
-        Optional<Integer> currentCompassIndex = nbt.getInt("index");
+        val registries: HolderLookup.Provider = event.getLevel().registryAccess()
+        val currentCompassReward = nbt.read<CompassReward?>(
+            "structure",
+            CompassReward.CODEC,
+            registries.createSerializationContext<Tag?>(NbtOps.INSTANCE)
+        )
+        val currentCompassIndex = nbt.getInt("index")
 
-        if (currentCompassReward.isEmpty() || currentCompassIndex.isEmpty())
-            return;
+        if (currentCompassReward.isEmpty() || currentCompassIndex.isEmpty()) return
 
-        int newCompassIndex = currentCompassIndex.get() + 1;
-        if (compasses.size() <= newCompassIndex) {
-            newCompassIndex = 0;
+        var newCompassIndex = currentCompassIndex.get() + 1
+        if (compasses.size <= newCompassIndex) {
+            newCompassIndex = 0
         }
-        nbt.putInt("index", newCompassIndex);
-        compass.set(DataComponents.CUSTOM_DATA, CustomData.of(nbt));
-        CompassReward newCompassReward = compasses.get(newCompassIndex);
+        nbt.putInt("index", newCompassIndex)
+        compass.set<CustomData?>(DataComponents.CUSTOM_DATA, CustomData.of(nbt))
+        val newCompassReward = compasses.get(newCompassIndex)
 
-        ItemManager.updateCompassLocation(newCompassReward, player, compass);
+        ItemManager.updateCompassLocation(newCompassReward, player, compass)
     }
 }

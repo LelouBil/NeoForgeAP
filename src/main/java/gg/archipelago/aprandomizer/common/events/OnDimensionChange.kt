@@ -1,23 +1,25 @@
-package gg.archipelago.aprandomizer.common.events;
+package gg.archipelago.aprandomizer.common.events
 
-import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager;
-import net.minecraft.server.level.ServerPlayer;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager
+import net.minecraft.server.level.ServerPlayer
+import net.neoforged.bus.api.SubscribeEvent
+import net.neoforged.fml.common.EventBusSubscriber
+import net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerChangedDimensionEvent
+import net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerRespawnEvent
 
 @EventBusSubscriber
-public class OnDimensionChange {
-
+object OnDimensionChange {
     @SubscribeEvent
-    public static void onChange1(PlayerEvent.PlayerChangedDimensionEvent event) {
-        if (!(event.getEntity() instanceof ServerPlayer player)) return;
-        ItemManager.refreshCompasses(player);
+    fun onChange1(event: PlayerChangedDimensionEvent) {
+        val player = event.getEntity()
+        if (player !is ServerPlayer) return
+        ItemManager.refreshCompasses(player)
     }
 
     @SubscribeEvent
-    public static void onChange1(PlayerEvent.PlayerRespawnEvent event) {
-        if (!(event.getEntity() instanceof ServerPlayer player)) return;
-        ItemManager.refreshCompasses(player);
+    fun onChange1(event: PlayerRespawnEvent) {
+        val player = event.getEntity()
+        if (player !is ServerPlayer) return
+        ItemManager.refreshCompasses(player)
     }
 }

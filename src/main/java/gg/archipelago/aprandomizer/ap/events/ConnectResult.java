@@ -3,6 +3,7 @@ package gg.archipelago.aprandomizer.ap.events;
 import dev.koifysh.archipelago.events.ArchipelagoEventListener;
 import dev.koifysh.archipelago.events.ConnectionResultEvent;
 import dev.koifysh.archipelago.network.ConnectionResult;
+import gg.archipelago.aprandomizer.GiftHandler;
 import gg.archipelago.aprandomizer.SlotData;
 import gg.archipelago.aprandomizer.ap.APClient;
 import gg.archipelago.aprandomizer.common.Utils.Utils;
@@ -12,6 +13,9 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.HolderLookup;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import static gg.archipelago.aprandomizer.APRandomizer.giftHandler;
+import static gg.archipelago.aprandomizer.APRandomizer.isJailPlayers;
 
 public class ConnectResult {
 
@@ -53,6 +57,9 @@ public class ConnectResult {
                 Utils.sendMessageToAll("Welcome to Death Link.");
                 APClient.setDeathLinkEnabled(true);
             }
+
+
+            giftHandler = new GiftHandler(APClient);
 
             advancementManager.setCheckedAdvancements(new LongOpenHashSet(APClient.getLocationManager().getCheckedLocations()));
 

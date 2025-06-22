@@ -2,16 +2,26 @@ package gg.archipelago.aprandomizer.ap;
 
 import dev.koifysh.archipelago.Client;
 import dev.koifysh.archipelago.flags.ItemsHandling;
+import gg.archipelago.aprandomizer.GiftHandler;
 import gg.archipelago.aprandomizer.SlotData;
 import gg.archipelago.aprandomizer.ap.events.*;
 import gg.archipelago.aprandomizer.common.Utils.Utils;
 import gg.archipelago.aprandomizer.managers.GoalManager;
 import gg.archipelago.aprandomizer.managers.advancementmanager.AdvancementManager;
 import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager;
+import gg.archipelago.gifting.api.GiftingService;
+import gg.archipelago.gifting.api.GiftingServiceImpl;
+import gg.archipelago.gifting.remote.GiftBoxDescriptor;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import kotlin.coroutines.Continuation;
+import kotlinx.coroutines.GlobalScope;
 import net.minecraft.server.MinecraftServer;
 import org.jetbrains.annotations.Nullable;
+
+import javax.net.SocketFactory;
+import java.net.URI;
+import java.util.ArrayList;
 
 public class APClient extends Client {
 

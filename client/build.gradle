@@ -8,6 +8,12 @@ dependencies {
         exclude group: "com.google.code.gson"
         exclude group: "org.slf4j"
     }
+    api(group: "net.leloubil.archipelago", name: "gifting-jvm", version: "1.0-SNAPSHOT") {
+        transitive = false
+        exclude group: "com.google.code.gson"
+        exclude group: "org.jetbrains.kotlinx"
+        exclude group: "org.jetbrains.kotlin"
+    }
 }
 
 tasks.shadowJar {

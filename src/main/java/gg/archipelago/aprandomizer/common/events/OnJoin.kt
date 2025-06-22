@@ -1,63 +1,59 @@
-package gg.archipelago.aprandomizer.common.events;
+package gg.archipelago.aprandomizer.common.events
 
-import gg.archipelago.aprandomizer.APRandomizer;
-import gg.archipelago.aprandomizer.ap.storage.APMCData;
-import gg.archipelago.aprandomizer.common.Utils.Utils;
-import gg.archipelago.aprandomizer.managers.GoalManager;
-import gg.archipelago.aprandomizer.managers.advancementmanager.AdvancementManager;
-import gg.archipelago.aprandomizer.managers.itemmanager.ItemManager;
-import net.minecraft.core.BlockPos;
-import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.level.GameType;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import gg.archipelago.aprandomizer.APRandomizer
+import gg.archipelago.aprandomizer.ap.storage.APMCData
+import gg.archipelago.aprandomizer.common.Utils.Utils
+import net.minecraft.server.level.ServerPlayer
+import net.minecraft.world.level.GameType
+import net.neoforged.bus.api.SubscribeEvent
+import net.neoforged.fml.common.EventBusSubscriber
+import net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedInEvent
 
 @EventBusSubscriber
-public class OnJoin {
+object OnJoin {
     @SubscribeEvent
-    static void onPlayerLoginEvent(PlayerEvent.PlayerLoggedInEvent event) {
-        ServerPlayer player = (ServerPlayer) event.getEntity();
-        GoalManager goalManager = APRandomizer.getGoalManager();
-        if (goalManager == null){
-            Utils.sendMessageToAll("Goal Manager did not initialize");
-            return;
+    fun onPlayerLoginEvent(event: PlayerLoggedInEvent) {
+        val player = event.getEntity() as ServerPlayer
+        val goalManager = APRandomizer.getGoalManager()
+        if (goalManager == null) {
+            Utils.sendMessageToAll("Goal Manager did not initialize")
+            return
         }
-        ItemManager itemManager = APRandomizer.getItemManager();
-        if (itemManager == null){
-            Utils.sendMessageToAll("Item Manager did not initialize");
-            return;
+        val itemManager = APRandomizer.getItemManager()
+        if (itemManager == null) {
+            Utils.sendMessageToAll("Item Manager did not initialize")
+            return
         }
-        AdvancementManager advancementManager = APRandomizer.getAdvancementManager();
-        if (advancementManager == null){
-            Utils.sendMessageToAll("Advancement Manager did not initialize");
-            return;
+        val advancementManager = APRandomizer.getAdvancementManager()
+        if (advancementManager == null) {
+            Utils.sendMessageToAll("Advancement Manager did not initialize")
+            return
         }
 
-        if (APRandomizer.isRace())
-            player.setGameMode(GameType.SURVIVAL);
+        if (APRandomizer.isRace()) player.setGameMode(GameType.SURVIVAL)
 
-        APMCData data = APRandomizer.getApmcData();
+        val data = APRandomizer.getApmcData()
         if (data.state == APMCData.State.MISSING) {
-            Utils.sendMessageToAll("No APMC file found, please only start the server via the APMC file.");
-            return;
+            Utils.sendMessageToAll("No APMC file found, please only start the server via the APMC file.")
+            return
+        } else if (data.state == APMCData.State.INVALID_VERSION) {
+            Utils.sendMessageToAll("This Seed was generated using an incompatible randomizer version.")
+            return
+        } else if (data.state == APMCData.State.INVALID_SEED) {
+            Utils.sendMessageToAll("Supplied APMC file does not match world loaded. something went very wrong here.")
+            return
         }
-        else if (data.state == APMCData.State.INVALID_VERSION) {
-            Utils.sendMessageToAll("This Seed was generated using an incompatible randomizer version.");
-            return;
-        }
-        else if (data.state == APMCData.State.INVALID_SEED) {
-            Utils.sendMessageToAll("Supplied APMC file does not match world loaded. something went very wrong here.");
-            return;
-        }
-        advancementManager.syncAllAdvancements();
-        goalManager.updateInfoBar();
-        itemManager.catchUpPlayer(player);
+        advancementManager.syncAllAdvancements()
+        goalManager.updateInfoBar()
+        itemManager.catchUpPlayer(player)
 
         if (APRandomizer.isJailPlayers()) {
-            BlockPos jail = APRandomizer.getJailPosition();
-            player.teleportTo(jail.getX(), jail.getY(), jail.getZ());
-            player.setGameMode(GameType.SURVIVAL);
+            val jail = APRandomizer.getJailPosition()
+            player.teleportTo(jail.getX().toDouble(), jail.getY().toDouble(), jail.getZ().toDouble())
+            player.setGameMode(GameType.SURVIVAL)
+        } else {
+            APRandomizer.giftHandler.openGiftBox()
+            APRandomizer.giftHandler.startReception()
         }
     }
 }
