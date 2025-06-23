@@ -1,39 +1,37 @@
-package gg.archipelago.aprandomizer.common.Utils;
+package gg.archipelago.aprandomizer.common.Utils
 
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.tick.ServerTickEvent;
-
-import java.util.LinkedList;
-import java.util.List;
+import net.neoforged.bus.api.SubscribeEvent
+import net.neoforged.fml.common.EventBusSubscriber
+import net.neoforged.neoforge.event.tick.ServerTickEvent
+import java.util.*
 
 @EventBusSubscriber
-public class TitleQueue {
+object TitleQueue {
+    val titleQueue: MutableList<QueuedTitle> = LinkedList<QueuedTitle>()
 
-    static final List<QueuedTitle> titleQueue = new LinkedList<>();
-
-    static int titleTime;
+    var titleTime: Int = 0
 
     @SubscribeEvent
-    static public void serverTick(ServerTickEvent.Post tick) {
+    fun serverTick(tick: ServerTickEvent.Post?) {
         if (!titleQueue.isEmpty()) {
             if (titleTime <= 0) {
-                QueuedTitle title = titleQueue.getFirst();
-                titleQueue.removeFirst();
-                titleTime = title.getTicks();
-                title.sendTitle();
+                val title: QueuedTitle = titleQueue.first()
+                titleQueue.removeFirst()
+                titleTime = title.getTicks()
+                title.sendTitle()
             }
         }
         if (titleTime > 0) {
-            titleTime -= 1;
+            titleTime -= 1
         }
     }
 
-    public static void queueTitle(QueuedTitle queuedTitle) {
-        titleQueue.add(queuedTitle);
+    @JvmStatic
+    fun queueTitle(queuedTitle: QueuedTitle?) {
+        titleQueue.add(queuedTitle!!)
     }
 
-    public static void clearTitleQueue() {
-        titleQueue.clear();
+    fun clearTitleQueue() {
+        titleQueue.clear()
     }
 }
