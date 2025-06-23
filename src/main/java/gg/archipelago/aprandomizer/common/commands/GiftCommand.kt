@@ -80,11 +80,19 @@ object GiftCommand {
         // Check if the item can be sent
         val giftHandler = APRandomizer.getGiftHandler()
 
-        giftHandler.giftItem(heldItem, recipient).whenComplete { giftingError,v ->
-            commandSourceCommandContext.getSource()!!
-                .sendFailure(Component.literal("Error while gifting item: " + giftingError))
-            player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY) // Clear the item from the player's hand
-        }
+        //todo debug
+//        giftHandler.giftItem(heldItem, recipient).whenComplete { giftingError,v ->
+//            commandSourceCommandContext.getSource()!!
+//                .sendFailure(Component.literal("Error while gifting item: " + giftingError))
+//            player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY) // Clear the item from the player's hand
+//        }
+        commandSourceCommandContext.source!!.sendSuccess(
+            {
+                Component.literal(
+                    "Item traits : " + giftHandler.getGiftItem(heldItem).toString()
+                )
+            }, true
+        )
 
         return 0;
     }

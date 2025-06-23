@@ -3,6 +3,7 @@ package gg.archipelago.aprandomizer.ap.events;
 import dev.koifysh.archipelago.events.ArchipelagoEventListener;
 import dev.koifysh.archipelago.events.ConnectionResultEvent;
 import dev.koifysh.archipelago.network.ConnectionResult;
+import gg.archipelago.aprandomizer.APRandomizer;
 import gg.archipelago.aprandomizer.GiftHandler;
 import gg.archipelago.aprandomizer.SlotData;
 import gg.archipelago.aprandomizer.ap.APClient;
@@ -59,7 +60,7 @@ public class ConnectResult {
             }
 
 
-            giftHandler = new GiftHandler(APClient);
+            APRandomizer.tryEnableGifting();
 
             advancementManager.setCheckedAdvancements(new LongOpenHashSet(APClient.getLocationManager().getCheckedLocations()));
 

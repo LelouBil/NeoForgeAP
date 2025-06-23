@@ -52,8 +52,7 @@ object OnJoin {
             player.teleportTo(jail.getX().toDouble(), jail.getY().toDouble(), jail.getZ().toDouble())
             player.setGameMode(GameType.SURVIVAL)
         } else {
-            APRandomizer.giftHandler.openGiftBox()
-            APRandomizer.giftHandler.startReception()
+            APRandomizer.tryEnableGifting()
         }
     }
 }

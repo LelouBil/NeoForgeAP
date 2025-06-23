@@ -14,12 +14,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.future.asCompletableFuture
 import kotlinx.coroutines.launch
-import kotlinx.serialization.descriptors.PrimitiveKind
 import net.minecraft.core.Holder
 import net.minecraft.core.HolderSet
 import net.minecraft.core.component.TypedDataComponent
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.tags.TagKey
+import net.minecraft.util.context.ContextMap
 import net.minecraft.world.effect.MobEffect
 import net.minecraft.world.effect.MobEffectCategory
 import net.minecraft.world.effect.MobEffectInstance
@@ -30,7 +30,6 @@ import net.minecraft.world.entity.ai.attributes.AttributeModifier
 import net.minecraft.world.entity.ai.attributes.Attributes
 import net.minecraft.world.entity.ai.attributes.RangedAttribute
 import net.minecraft.world.food.FoodProperties
-import net.minecraft.world.inventory.ContainerData
 import net.minecraft.world.item.BlockItem
 import net.minecraft.world.item.Item
 import net.minecraft.world.item.ItemStack
@@ -51,32 +50,63 @@ import net.minecraft.world.item.consume_effects.ClearAllStatusEffectsConsumeEffe
 import net.minecraft.world.item.consume_effects.PlaySoundConsumeEffect
 import net.minecraft.world.item.consume_effects.RemoveStatusEffectsConsumeEffect
 import net.minecraft.world.item.consume_effects.TeleportRandomlyConsumeEffect
+import net.minecraft.world.item.crafting.RecipeType
 import net.minecraft.world.item.equipment.Equippable
 import net.minecraft.world.level.block.Block
-import net.minecraft.world.level.block.entity.FuelValues
-import net.minecraft.world.level.block.entity.FurnaceBlockEntity
 import net.neoforged.neoforge.capabilities.Capabilities
 import net.neoforged.neoforge.common.BooleanAttribute
 import net.neoforged.neoforge.common.PercentageAttribute
+import net.neoforged.neoforge.fluids.capability.IFluidHandler
 import java.util.concurrent.CompletableFuture
+import kotlin.collections.plus
+import kotlin.math.max
+import kotlin.streams.asSequence
 
+enum class GiftTraitSource {
+    CRAFTING, TAGS, ITEM_COMPONENTS, ITEM_SPECIFIC, CAPABILITIES, BASED_ON_OTHER_TRAITS, ATTRIBUTE_MODIFIERS,
+}
+
+private data class GiftTraitHolder(
+    val trait: GiftTrait,
+    val source: GiftTraitSource,
+) {
+    val name: GiftTraitName
+        get() = trait.name
+    val quality: Float
+        get() = trait.quality
+    val duration: Float
+        get() = trait.duration
+
+    fun copy(source: GiftTraitSource, quality: Float = this.quality, duration: Float = this.duration): GiftTraitHolder {
+        return GiftTraitHolder(
+            trait = GiftTrait(name, quality, duration), source = source
+        )
+    }
+}
+
+private fun GiftTrait.convert(source: GiftTraitSource): GiftTraitHolder {
+    return GiftTraitHolder(
+        trait = this, source = source
+    )
+}
+
+private fun List<GiftTrait>.convert(source: GiftTraitSource): List<GiftTraitHolder> {
+    return this.map { it.convert(source) }
+}
 
 private val CanGiftResult.CanGiftError.userFacing
     get() = when (this) {
         CanGiftResult.CanGiftError.DataStorageWriteError -> "Failed to write to data storage."
-        is CanGiftResult.CanGiftError.DataVersionTooLow ->
-            "The recipient's data version is too low to receive gifts. Minimum required: ${this.recipientMinimumVersion}."
+        is CanGiftResult.CanGiftError.DataVersionTooLow -> "The recipient's data version is too low to receive gifts. Minimum required: ${this.recipientMinimumVersion}."
 
         CanGiftResult.CanGiftError.GiftBoxClosed -> "The recipient's gift box is closed."
-        is CanGiftResult.CanGiftError.NoMatchingTraits ->
-            "The recipient does not accept any of the traits of this gift. Accepted traits: ${
-                this.recipientAcceptedTraits.joinToString(
-                    ", "
-                )
-            }."
+        is CanGiftResult.CanGiftError.NoMatchingTraits -> "The recipient does not accept any of the traits of this gift. Accepted traits: ${
+            this.recipientAcceptedTraits.joinToString(
+                ", "
+            )
+        }."
 
-        is CanGiftResult.CanGiftError.PlayerSlotNotFound ->
-            "The recipient's player slot ${this.playerSlot} was not found."
+        is CanGiftResult.CanGiftError.PlayerSlotNotFound -> "The recipient's player slot ${this.playerSlot} was not found."
     }
 
 private const val averageDurability = 250f
@@ -124,11 +154,86 @@ class GiftHandler(client: APClient) {
                 if (item == Items.AIR || item == Items.AIR.asItem()) return@forEach // skip air item
                 println("Registering item: ${BuiltInRegistries.ITEM.getKey(item)}")
                 val stack = ItemStack(item, 1)
-                val traits = getGiftItem(stack).traits
+                val traits = resolveItemTraits(stack).map { it.trait }
                 matcher.RegisterAvailableGift(stack, traits)
             }
             println("Finished")
         }
+    }
+
+
+    private val craftTraitsCache = mutableMapOf<Item, List<GiftTraitHolder>>()
+    private fun getCraftTraits(item: Item): List<GiftTraitHolder> {
+        if (craftTraitsCache.containsKey(item)) {
+            return craftTraitsCache[item]!!
+        }
+        craftTraitsCache[item] = emptyList() // todo find better way to avoid infinite recursion
+        val recipeMap = APRandomizer.server!!.recipeManager.recipeMap()
+        // find recipes outputting the item
+        val recipesMaking = recipeMap.byType(RecipeType.CRAFTING).mapNotNull { recipe ->
+            recipe.value.display()
+                .flatMap { it.result().resolveForStacks(ContextMap.EMPTY) }
+                .find { it.item == item }
+                ?.let { recipe to it }
+        }
+
+        //find recipes which use the item as an ingredient
+        val recipesUsing = recipeMap.byType(RecipeType.CRAFTING).filter { recipe ->
+            recipe.value.placementInfo().ingredients().any { ing ->
+                if (ing.isCustom) {
+                    ing.customIngredient!!.items().anyMatch { it.value() == item }
+                } else {
+                    ing.values.any { it.value() == item }
+                }
+            }
+        }
+
+        val materialScore = (recipesUsing.count() / 10f).coerceAtMost(3f) // arbitrary
+        val materialTrait = if (materialScore > 0) {
+            KnownTraits.Material.copy(quality = materialScore).convert(GiftTraitSource.CRAFTING)
+        } else {
+            null
+        }
+        val traits = recipesMaking.map { (recipe,output) ->
+            val ingredients = recipe.value.placementInfo().ingredients()
+            val allIngredientTraits: List<GiftTraitHolder> = ingredients.flatMap { ing ->
+                val itemSet = if (ing.isCustom) ing.customIngredient!!.items().toList() else ing.values
+                val singleIngredientTraits = when (itemSet) {
+                    is HolderSet.Named<Item> -> itemTagsToTraits(itemSet.key())
+                    is HolderSet.ListBacked<Item> -> itemSet.stream().asSequence().map {
+                        resolveItemTraits(ItemStack(it, 1))
+                    }.reduce { acc, traits ->
+                        val namesInter = acc.map { it.name }.intersect(traits.map { it.name })
+                        (acc + traits).filter { it.name in namesInter }
+                    }
+
+                    else -> emptyList()
+                }
+                singleIngredientTraits.map {
+                    it.copy(
+                        GiftTraitSource.CRAFTING, quality = it.quality / output.count
+                    )
+                }
+            }
+            allIngredientTraits
+        }.flatten()
+            // average qualities of same traits
+            .groupBy {
+                it.name
+            }.map { (name, traits) ->
+                traits.reduce { acc, trait ->
+                    trait.copy(
+                        source = GiftTraitSource.CRAFTING,
+                        quality = (acc.quality + trait.quality) / 2f,
+                        duration = (acc.duration + trait.duration) / 2f
+                    )
+                }
+            }.filter {
+                it.quality > 0.01f // filter out traits with very low quality
+            }
+        return (traits + materialTrait?.let { listOf(it) }.orEmpty()).filter {
+            craftingInheritedTraits.isMember(it)
+        }.also { craftTraitsCache[item] = it }
     }
 
     fun closeGiftBox(): CompletableFuture<Boolean> {
@@ -146,10 +251,8 @@ class GiftHandler(client: APClient) {
      */
     fun canSendItem(stack: ItemStack, recipient: NetworkPlayer): CompletableFuture<String?> {
         return GlobalScope.async {
-            val res =
-                giftingService.canGiftToPlayer(
-                    recipient.slot, recipient.team,
-                    getGiftItem(stack).traits.map { it.name })
+            val res = giftingService.canGiftToPlayer(
+                recipient.slot, recipient.team, getGiftItem(stack).traits.map { it.name })
 
 
             when (res) {
@@ -168,8 +271,10 @@ class GiftHandler(client: APClient) {
      */
     fun giftItem(stack: ItemStack, recipient: NetworkPlayer): CompletableFuture<String?> {
         return GlobalScope.async {
+            val item = getGiftItem(stack)
+            println("Gifting item: $item to recipient: ${recipient.name} (slot: ${recipient.slot}, team: ${recipient.team})")
             val res = giftingService.sendGift(
-                item = getGiftItem(stack),
+                item = item,
                 amount = stack.count,
                 recipientPlayerSlot = recipient.slot,
                 recipientPlayerTeam = recipient.team
@@ -183,77 +288,110 @@ class GiftHandler(client: APClient) {
         }.asCompletableFuture()
     }
 
-    private fun itemSpecificTraits(item: Item): List<GiftTrait> {
-        return when (item) {
-            Items.TNT -> listOf(KnownTraits.Bomb)
-            Items.TOTEM_OF_UNDYING -> listOf(KnownTraits.Artifact, KnownTraits.Ancient)
-            Items.ELYTRA -> listOf(KnownTraits.Artifact)
-            Items.SNOWBALL -> listOf(KnownTraits.Ice, KnownTraits.Throwing)
-            Items.POWDER_SNOW_BUCKET -> listOf(KnownTraits.Ice)
-            Items.DECORATED_POT -> listOf(KnownTraits.Ceramic)
-            Items.ENCHANTED_BOOK -> listOf(KnownTraits.Scroll, KnownTraits.IQ, KnownTraits.Buff)
-            Items.BONE -> listOf(KnownTraits.Bone)
-            Items.BONE_BLOCK -> listOf(KnownTraits.Fossil, KnownTraits.Bone)
-            Items.BONE_MEAL -> listOf(KnownTraits.Bone)
-            Items.REDSTONE -> listOf(KnownTraits.Energy.copy(quality = 0.1f))
-            Items.REDSTONE_BLOCK -> listOf(KnownTraits.Energy.copy(quality = 0.5f))
-            Items.GLOWSTONE_DUST -> listOf(KnownTraits.Light.copy(quality = 0.1f))
-            Items.GLOWSTONE -> listOf(KnownTraits.Light.copy(quality = 0.5f))
-            Items.NOTE_BLOCK -> listOf(KnownTraits.Instrument)
-            Items.JUKEBOX -> listOf(KnownTraits.Instrument.copy(quality = 0.5f))
-            Items.REPEATER -> listOf(KnownTraits.Electronics.copy(quality = 0.1f))
-            Items.COMPARATOR -> listOf(KnownTraits.Electronics.copy(quality = 0.5f))
-            Items.PAINTING -> listOf(KnownTraits.Luxury)
-            Items.ITEM_FRAME -> listOf(KnownTraits.Luxury.copy(quality = 0.5f))
-            Items.ARMOR_STAND -> listOf(KnownTraits.Luxury.copy(quality = 0.1f), KnownTraits.Statue)
-            Items.GOAT_HORN -> listOf(KnownTraits.Instrument, KnownTraits.Goat)
-            Items.CLAY -> listOf(KnownTraits.Beach, KnownTraits.Clay)
-            Items.DEAD_BUSH -> listOf(KnownTraits.Bush, KnownTraits.Dry)
-            Items.HEART_OF_THE_SEA -> listOf(KnownTraits.Artifact, KnownTraits.Ocean, KnownTraits.Ancient)
-            Items.NAUTILUS_SHELL -> listOf(KnownTraits.Ocean, KnownTraits.Ancient)
-            Items.TRIDENT -> listOf(KnownTraits.Trident, KnownTraits.Ocean, KnownTraits.Ancient)
-            Items.PAPER -> listOf(KnownTraits.Paper)
-            Items.FIREWORK_ROCKET -> listOf(KnownTraits.Firework, KnownTraits.Rocket)
-            Items.SPLASH_POTION -> listOf(KnownTraits.Throwing)
-            Items.LINGERING_POTION -> listOf(KnownTraits.Throwing)
-             else -> emptyList()
-        } +
-                if (APRandomizer.server!!.overworld().fuelValues().isFuel(ItemStack(item, 1))) {
-                    listOf(KnownTraits.Fuel)
-                } else {
-                    emptyList()
-                }
+    private fun itemSpecificTraits(item: Item): List<GiftTraitHolder> = convertScope(GiftTraitSource.ITEM_SPECIFIC) {
+        val res: List<GiftTraitHolder> = when (item) {
+            Items.TNT -> listOf(KnownTraits.Bomb).convert()
+            Items.TOTEM_OF_UNDYING -> listOf(KnownTraits.Artifact, KnownTraits.Ancient).convert()
+            Items.ELYTRA -> listOf(KnownTraits.Artifact).convert()
+            Items.SNOWBALL -> listOf(KnownTraits.Ice, KnownTraits.Throwing).convert()
+            // because the automatic inheritance only works if a "milk" or "powder_snow" fluid exists
+            Items.POWDER_SNOW_BUCKET -> listOf(KnownTraits.Ice) + resolveItemTraits(ItemStack(Items.BUCKET))
+            Items.MILK_BUCKET -> resolveItemTraits(ItemStack(Items.BUCKET))
+            Items.DECORATED_POT -> listOf(KnownTraits.Ceramic).convert()
+            Items.ENCHANTED_BOOK -> listOf(KnownTraits.Scroll, KnownTraits.IQ, KnownTraits.Buff).convert()
+            Items.BONE -> listOf(KnownTraits.Bone).convert()
+            Items.BONE_BLOCK -> listOf(KnownTraits.Fossil, KnownTraits.Bone).convert()
+            Items.BONE_MEAL -> listOf(KnownTraits.Bone).convert()
+            Items.REDSTONE -> listOf(KnownTraits.Energy.copy(quality = 0.1f)).convert()
+            Items.REDSTONE_BLOCK -> listOf(KnownTraits.Energy.copy(quality = 0.5f)).convert()
+            Items.GLOWSTONE_DUST -> listOf(KnownTraits.Light.copy(quality = 0.1f)).convert()
+            Items.GLOWSTONE -> listOf(KnownTraits.Light.copy(quality = 0.5f)).convert()
+            Items.NOTE_BLOCK -> listOf(KnownTraits.Instrument).convert()
+            Items.JUKEBOX -> listOf(KnownTraits.Instrument.copy(quality = 0.5f)).convert()
+            Items.REPEATER -> listOf(KnownTraits.Electronics.copy(quality = 0.1f)).convert()
+            Items.COMPARATOR -> listOf(KnownTraits.Electronics.copy(quality = 0.5f)).convert()
+            Items.PAINTING -> listOf(KnownTraits.Luxury).convert()
+            Items.ITEM_FRAME -> listOf(KnownTraits.Luxury.copy(quality = 0.5f)).convert()
+            Items.ARMOR_STAND -> listOf(KnownTraits.Luxury.copy(quality = 0.1f), KnownTraits.Statue).convert()
+            Items.GOAT_HORN -> listOf(KnownTraits.Instrument, KnownTraits.Goat).convert()
+            Items.CLAY -> listOf(KnownTraits.Beach, KnownTraits.Clay).convert()
+            Items.DEAD_BUSH -> listOf(KnownTraits.Bush, KnownTraits.Dry).convert()
+            Items.HEART_OF_THE_SEA -> listOf(KnownTraits.Artifact, KnownTraits.Ocean, KnownTraits.Ancient).convert()
+            Items.NAUTILUS_SHELL -> listOf(KnownTraits.Ocean, KnownTraits.Ancient).convert()
+            Items.TRIDENT -> listOf(KnownTraits.Trident, KnownTraits.Ocean, KnownTraits.Ancient).convert()
+            Items.PAPER -> listOf(KnownTraits.Paper).convert()
+            Items.FIREWORK_ROCKET -> listOf(KnownTraits.Firework, KnownTraits.Rocket).convert()
+            Items.SPLASH_POTION -> listOf(KnownTraits.Throwing).convert()
+            Items.LINGERING_POTION -> listOf(KnownTraits.Throwing).convert()
+            Items.ENDER_PEARL -> listOf(KnownTraits.Teleport, KnownTraits.Throwing).convert()
+            else -> emptyList()
+        } + match(item.toString()){
+            "torch" includes KnownTraits.Light
+            "soul" includes SpecificTraits.Nether
+        } + if(item is BlockItem) {
+            val emission = item.block.defaultBlockState().lightEmission / 15f // light emission is between 0 and 15
+            if (emission > 0) {
+                listOf(KnownTraits.Light.copy(quality = emission)).convert()
+            } else emptyList()
+        } else emptyList()
+
+        res + if (APRandomizer.server!!.overworld().fuelValues().isFuel(ItemStack(item, 1))) {
+            listOf(KnownTraits.Fuel).convert()
+        } else {
+            emptyList()
+        }
     }
 
-    private fun capabilities(item: ItemStack): List<GiftTrait> {
-        val traits = mutableListOf<GiftTrait>()
+    private fun capabilities(item: ItemStack): List<GiftTraitHolder> = convertScope(GiftTraitSource.CAPABILITIES) {
+        val traits = mutableListOf<GiftTraitHolder>()
         if (item.getCapability(Capabilities.ItemHandler.ITEM) != null) {
-            traits.add(KnownTraits.Container)
+            traits.add(KnownTraits.Container.convert())
         }
         val fluidcap = item.getCapability(Capabilities.FluidHandler.ITEM)
         if (fluidcap != null) {
-            traits.add(KnownTraits.Container)
-            traits.add(KnownTraits.LiquidContainer)
+            traits.add(KnownTraits.Container.convert())
+            traits.add(KnownTraits.LiquidContainer.convert())
             val fls = (0..fluidcap.tanks).map { fluidcap.getFluidInTank(it) }
             fls.forEach { fluid ->
                 traits.add(
                     GiftTrait(
-                        name = GiftTraitName(fluid.fluidHolder.key!!.location().path),
+                        name = GiftTraitName(fluid.fluidHolder.key!!.location().path.capitalize()),
                         quality = fluid.amount / 1000f
-                    )
+                    ).convert()
                 )
             }
+
+            val copied = item.copy()
+            val capability = copied.getCapability(Capabilities.FluidHandler.ITEM)
+            for (i in 0 until capability!!.tanks) {
+                val fluidInTank = capability.getFluidInTank(i)
+                if (fluidInTank.isEmpty) continue
+                capability.drain(fluidInTank.copyWithAmount(Int.MAX_VALUE), IFluidHandler.FluidAction.EXECUTE);
+            }
+            val itemWithoutFluid = capability.container
+            if (itemWithoutFluid.item != item.item) {
+                // add all traits that weren't already present
+                val resolveItemTraits: List<GiftTraitHolder> = resolveItemTraits(itemWithoutFluid)
+                resolveItemTraits.forEach { trait ->
+                    if (traits.none { it.name == trait.name }) {
+                        traits.add(trait)
+                    }
+                }
+            }
+
         }
         val energyCap = item.getCapability(Capabilities.EnergyStorage.ITEM)
         if (energyCap != null) {
-            traits.add(KnownTraits.Energy.copy(quality = energyCap.energyStored / 1000f))
+            traits.add(KnownTraits.Energy.copy(quality = energyCap.energyStored / 1000f).convert())
         }
         return traits
     }
 
-    private fun getGiftItem(itemStack: ItemStack): GiftItem {
-        val item = itemStack.item
-        val traits = (item.components().flatMap {
+    private fun resolveItemTraits(
+        stack: ItemStack,
+    ): List<GiftTraitHolder> {
+        val item = stack.item
+        val traits = (stack.components.flatMap {
             componentToTraits(it)
         } + when (item) {
             is BlockItem -> {
@@ -261,158 +399,211 @@ class GiftHandler(client: APClient) {
             }
 
             else -> emptyList()
-        } + BuiltInRegistries.ITEM.wrapAsHolder(item).tags().toList().flatMap(::itemTagsToTraits)
-                + itemSpecificTraits(item)
-                + capabilities(itemStack) + if (itemStack.nextDamageWillBreak() || itemStack.isBroken) {
-            listOf(KnownTraits.Broken)
+        } + BuiltInRegistries.ITEM.wrapAsHolder(item).tags().toList().flatMap(::itemTagsToTraits) + itemSpecificTraits(
+            item
+        ) + capabilities(stack) + if (stack.nextDamageWillBreak() || stack.isBroken) {
+            listOf(KnownTraits.Broken).convert(GiftTraitSource.ITEM_COMPONENTS)
         } else {
             emptyList()
         })
+        return removeDuplicates(traits + basedOn(stack, traits) + getCraftTraits(stack.item))
+    }
 
+    fun getGiftItem(itemStack: ItemStack): GiftItem {
+        val item = itemStack.item
         return GiftItem(
             name = BuiltInRegistries.ITEM.getKey(item).toString(),
-            traits =
-                removeDuplicates(traits + basedOn(itemStack, traits))
-        )
+            traits = resolveItemTraits(itemStack).map { it.trait })
     }
 
-    private fun removeDuplicates(traits: List<GiftTrait>): List<GiftTrait> {
-        //keep only a single instance of each traits, but handle quality and duration like this :
-        // if a trait exists with quality != 0 and another with quality == 0, keep the one with quality != 0
-        // same for duration, keep the values different than the default (0)
-        // and for values that are different than the default, average them.
-        val traitMap = mutableMapOf<GiftTraitName, GiftTrait>()
-        traits.forEach { trait ->
-            val existingTrait = traitMap[trait.name]
-            if (existingTrait == null) {
-                traitMap[trait.name] = trait
+    private fun removeDuplicates(traits: List<GiftTraitHolder>): List<GiftTraitHolder> {
+        return traits.groupBy { it.trait.name }.map { (name, traits) ->
+            traits.reduce { acc, trait ->
+                when (trait.source) {
+                    GiftTraitSource.ITEM_COMPONENTS -> {
+                        // keep the item component traits as they are
+                        when (acc.source) {
+                            GiftTraitSource.ITEM_COMPONENTS -> {
+                                // if the acc is also from item components, average the quality and duration
+                                acc.copy(
+                                    source = GiftTraitSource.ITEM_COMPONENTS,
+                                    quality = max(acc.quality, trait.quality),
+                                    duration = max(acc.duration, trait.duration)
+                                )
+                            }
+
+                            else -> trait // if the acc is not from item components, just keep the current trait
+                        }
+                    }
+
+                    GiftTraitSource.CRAFTING -> {
+                        when (acc.source) {
+                            GiftTraitSource.CRAFTING -> {
+                                // if the acc is also from crafting, add quality and average duration
+                                acc.copy(
+                                    source = GiftTraitSource.CRAFTING,
+                                    quality = (acc.quality + trait.quality),
+                                    duration = (acc.duration + trait.duration) / 2f
+                                )
+                            }
+
+                            else -> trait // if the acc is not from crafting, just keep the current trait
+                        }
+                    }
+
+                    GiftTraitSource.TAGS -> {
+                        trait.copy(source = GiftTraitSource.TAGS, quality = 1f)
+                    }
+
+                    else -> {
+                        // for all other sources, just average the quality and duration
+                        trait.copy(
+                            source = acc.source,
+                            quality = (acc.quality + trait.quality) / 2f,
+                            duration = (acc.duration + trait.duration) / 2f
+                        )
+                    }
+                }
+            }
+
+        }
+    }
+
+    private fun basedOn(itemStack: ItemStack, traits: List<GiftTraitHolder>): List<GiftTraitHolder> = convertScope(
+        GiftTraitSource.BASED_ON_OTHER_TRAITS
+    ) {
+
+
+        val attackDamage = traits.find { it.name == KnownTraits.Damage.name }
+        val attackSpeed = traits.find { it.name == ExtraTraits.AttackSpeed.name }
+        val armorValue = traits.find { it.name == KnownTraits.Armor.name }
+        val armorToughness = traits.find { it.name == ExtraTraits.ArmorToughness.name }
+        val hasFire = traits.any { it.name == KnownTraits.Fire.name }
+
+        return traits.flatMap { trait ->
+            val duration = (itemStack.maxDamage - itemStack.damageValue) / averageDurability
+            if (objectWithUsage.isMember(trait)) {
+                listOf(
+                    trait.copy(
+                        source = GiftTraitSource.BASED_ON_OTHER_TRAITS,
+                        duration = duration,
+                    )
+                )
+            } else if (itemStack.isDamageableItem) {
+                listOf(
+                    trait, KnownTraits.Tool.copy(duration = duration, quality = 0.1f).convert()
+                )
+            } else listOf(trait)
+        }.map { trait ->
+            if (weaponTraits.isMember(trait)) {
+                val weaponValue = (attackSpeed?.quality?.div(4f) ?: 1f) * (attackDamage?.quality ?: 1f)
+                trait.copy(source = GiftTraitSource.BASED_ON_OTHER_TRAITS, quality = weaponValue)
+            } else trait
+        }.map { trait ->
+            if (trait.name == KnownTraits.Armor.name) {
+                val armorValue = armorValue?.quality ?: 0f
+                val toughnessBonus = armorToughness?.quality?.div(20f) ?: 0f // Toughness is capped at 20
+                trait.copy(
+                    source = GiftTraitSource.BASED_ON_OTHER_TRAITS, quality = armorValue * (1 + toughnessBonus)
+                )
+            } else trait
+        }.flatMap { trait ->
+            if (compositionTraits.isMember(trait) && !objectWithUsage.isMember(trait)) {
+                listOf(trait, KnownTraits.Resource.copy(quality = 0.1f).convert())
+            } else listOf(trait)
+        }.flatMap { trait ->
+            if(trait.name == SpecificTraits.Nether.name && !hasFire) {
+                // if the item is from the nether, but does not have fire, add fire trait
+                listOf(trait, KnownTraits.Fire.copy(quality = 0.1f).convert())
             } else {
-                // average quality and duration
-                val newQuality = if (trait.quality != 0f) {
-                    (existingTrait.quality + trait.quality) / 2f
-                } else {
-                    existingTrait.quality
-                }
-                val newDuration = if (trait.duration != 0f) {
-                    (existingTrait.duration + trait.duration) / 2f
-                } else {
-                    existingTrait.duration
-                }
-                traitMap[trait.name] = existingTrait.copy(quality = newQuality, duration = newDuration)
+                listOf(trait)
             }
         }
-        return traitMap.values.toList()
-    }
-
-    private fun basedOn(itemStack: ItemStack, traits: List<GiftTrait>): List<GiftTrait> {
-        //resource and material condition :
-        //if not block, weapon, tool, armor, consumable, food
-        var resmat = if (itemStack.item !is BlockItem && traits.none {
-                it.name == KnownTraits.Tool.name ||
-                        it.name == KnownTraits.Weapon.name ||
-                        it.name == KnownTraits.Armor.name ||
-                        it.name == KnownTraits.Consumable.name ||
-                        it.name == KnownTraits.Food.name
-            }) {
-            listOf(KnownTraits.Resource, KnownTraits.Material)
-        } else
-            emptyList()
-
-        val durabilityTraits = traits.filter {
-            it.name == KnownTraits.Tool.name ||
-                    it.name == KnownTraits.Weapon.name ||
-                    it.name == KnownTraits.Armor.name
-        }.toMutableList()
-
-        val durability = if (itemStack.isDamageableItem) {
-            if (!durabilityTraits.any()) {
-                durabilityTraits += KnownTraits.Tool
-            }
-            val ratio = itemStack.damageValue / averageDurability
-            durabilityTraits.map { it.copy(duration = ratio) }
-        } else emptyList()
-
-        return resmat + durability
     }
 
     //todo duration = durability (but take into account durability usage per use)
-    private fun componentToTraits(component: TypedDataComponent<*>): List<GiftTrait> {
-        return when (val data = component.value) {
-            is Consumable -> {
-                return listOf(KnownTraits.Consumable) + data.onConsumeEffects.flatMap {
-                    return when (it) {
-                        is ApplyStatusEffectsConsumeEffect -> effectsToTraits(it.effects)
-                        is ClearAllStatusEffectsConsumeEffect -> listOf(KnownTraits.Cure)
-                        is TeleportRandomlyConsumeEffect -> listOf(KnownTraits.Teleport)
-                        is RemoveStatusEffectsConsumeEffect -> listOf() //todo ?
-                        is PlaySoundConsumeEffect -> listOf() //todo ?
-                        else -> error("unreachable")
+    private fun componentToTraits(component: TypedDataComponent<*>): List<GiftTraitHolder> =
+        convertScope(GiftTraitSource.ITEM_COMPONENTS) {
+            return when (val data = component.value) {
+                is Consumable -> {
+                    return listOf(KnownTraits.Consumable) + data.onConsumeEffects.flatMap {
+                        return when (it) {
+                            is ApplyStatusEffectsConsumeEffect -> effectsToTraits(it.effects)
+                            is ClearAllStatusEffectsConsumeEffect -> listOf(KnownTraits.Cure).convert()
+                            is TeleportRandomlyConsumeEffect -> listOf(KnownTraits.Teleport).convert()
+                            is RemoveStatusEffectsConsumeEffect -> listOf() //todo ?
+                            is PlaySoundConsumeEffect -> listOf() //todo ?
+                            else -> error("unreachable")
+                        }
+                    } + when (data.animation) {
+                        ItemUseAnimation.EAT -> listOf(KnownTraits.Food).convert()
+                        ItemUseAnimation.DRINK -> listOf(KnownTraits.Drink).convert()
+                        else -> emptyList()
                     }
-                } + when (data.animation) {
-                    ItemUseAnimation.EAT -> listOf(KnownTraits.Food)
-                    ItemUseAnimation.DRINK -> listOf(KnownTraits.Drink)
-                    else -> emptyList()
+
                 }
 
-            }
+                is Rarity -> when (data) {
+                    Rarity.COMMON -> emptyList()
+                    Rarity.UNCOMMON -> emptyList()
+                    Rarity.RARE -> emptyList()
+                    Rarity.EPIC -> listOf(KnownTraits.Legendary).convert()
+                }
 
-            is Rarity -> when (data) {
-                Rarity.COMMON -> emptyList()
-                Rarity.UNCOMMON -> emptyList()
-                Rarity.RARE -> emptyList()
-                Rarity.EPIC -> listOf(KnownTraits.Legendary)
-            }
+                is SuspiciousStewEffects -> listOf(
+                    ExtraTraits.Suspicious,
+                    KnownTraits.Random,
+                    KnownTraits.Food.copy(quality = 0.1f),
+                    KnownTraits.Buff.copy(quality = 0.5f),
+                    KnownTraits.Trap.copy(quality = 0.5f)
+                ).convert()
 
-            is SuspiciousStewEffects -> listOf(
-                ExtraTraits.Suspicious,
-                KnownTraits.Random,
-                KnownTraits.Food.copy(quality = 0.1f),
-                KnownTraits.Buff.copy(quality = 0.5f),
-                KnownTraits.Trap.copy(quality = 0.5f)
-            )
+                is Tool -> listOf(KnownTraits.Tool.copy(quality = data.defaultMiningSpeed)).convert() + data.rules.flatMap {
+                    val tag = (it.blocks as? HolderSet.Named<Block>)?.key() ?: return@flatMap emptyList()
+                    blockTagsToTraits(tag).map { t ->
+                        t.copy(
+                            GiftTraitSource.ITEM_COMPONENTS, quality = it.speed.orElse(data.defaultMiningSpeed)
+                        )
+                    }
+                }
 
-            is Tool -> listOf(KnownTraits.Tool.copy(quality = data.defaultMiningSpeed)) + data.rules.flatMap {
-                val tag = (it.blocks as? HolderSet.Named<Block>)?.key() ?: return@flatMap emptyList()
-                blockTagsToTraits(tag).map { t -> t.copy(quality = it.speed.orElse(data.defaultMiningSpeed)) }
-            }
+                is Weapon -> listOf(KnownTraits.Weapon).convert()
+                is FoodProperties -> listOf(KnownTraits.Food.copy(quality = data.nutrition() / 3f)).convert()
+                is Equippable -> when (data.slot) {
+                    EquipmentSlot.FEET, EquipmentSlot.LEGS, EquipmentSlot.CHEST, EquipmentSlot.BODY, EquipmentSlot.HEAD -> listOf(
+                        KnownTraits.Armor
+                    ).convert()
 
-            is Weapon -> listOf(KnownTraits.Weapon)
-            is FoodProperties -> listOf(KnownTraits.Food.copy(quality = data.nutrition() / 3f))
-            is Equippable -> when (data.slot) {
-                EquipmentSlot.FEET, EquipmentSlot.LEGS,
-                EquipmentSlot.CHEST, EquipmentSlot.BODY, EquipmentSlot.HEAD -> listOf(KnownTraits.Armor)
+                    EquipmentSlot.SADDLE -> listOf(ExtraTraits.Saddle).convert()
+                    else -> emptyList()
+                } + if (data.slot == EquipmentSlot.HEAD) {
+                    listOf(KnownTraits.Head).convert()
+                } else {
+                    emptyList()
+                }
 
-                EquipmentSlot.SADDLE -> listOf(ExtraTraits.Saddle)
-                else -> emptyList()
-            } + if (data.slot == EquipmentSlot.HEAD) {
-                listOf(KnownTraits.Head)
-            } else {
-                emptyList()
-            }
+                is PotionContents -> effectsToTraits(data.allEffects)
+                is DeathProtection -> listOf(
+                    KnownTraits.Life.copy(quality = 10f),
+                    KnownTraits.Buff.copy(quality = 10f),
+                    KnownTraits.Invincible.copy(duration = 0.1f),
 
-            is PotionContents -> effectsToTraits(data.allEffects)
-            is DeathProtection -> listOf(
-                KnownTraits.Life.copy(quality = 10f),
-                KnownTraits.Buff.copy(quality = 10f),
-                KnownTraits.Invincible.copy(duration = 0.1f),
+                    ).convert()
 
-                )
+                is BundleContents -> listOf(KnownTraits.Container).convert()
+                is ItemContainerContents -> listOf(KnownTraits.Container).convert()
 
-            is BundleContents -> listOf(KnownTraits.Container)
-            is ItemContainerContents -> listOf(KnownTraits.Container)
-
-            is ItemAttributeModifiers ->
-                data.modifiers.flatMap {
+                is ItemAttributeModifiers -> data.modifiers.flatMap {
                     // ignore slot since it should be based on other tags ?
                     // or maybe I should add specific conditions like, if slot is hand and modifier is attack damage, then add weapon trait?
                     modifierToTraits(it)
                 }
 
-            else -> return emptyList()
+                else -> return emptyList()
+            }
         }
-    }
 
-    private fun modifierToTraits(modifier: ItemAttributeModifiers.Entry): List<GiftTrait> {
+    private fun modifierToTraits(modifier: ItemAttributeModifiers.Entry): List<GiftTraitHolder> {
         return when (modifier.attribute) {
             Attributes.ATTACK_DAMAGE -> listOf(
                 KnownTraits.Damage.copy(
@@ -442,17 +633,19 @@ class GiftHandler(client: APClient) {
             )
 
             Attributes.ARMOR, Attributes.ARMOR_TOUGHNESS -> listOf(
-                KnownTraits.Armor.copy(quality = scaleQuality(modifier.attribute.value(), modifier.modifier).toFloat()),
+                ExtraTraits.ArmorToughness.copy(
+                    quality = scaleQuality(
+                        modifier.attribute.value(), modifier.modifier
+                    ).toFloat()
+                ),
             )
 
             else -> emptyList()
-        }
+        }.convert(GiftTraitSource.ATTRIBUTE_MODIFIERS)
     }
 
     private fun scaleQuality(
-        attribute: Attribute,
-        value: AttributeModifier,
-        base: Double = attribute.defaultValue
+        attribute: Attribute, value: AttributeModifier, base: Double = attribute.defaultValue
     ): Double {
         return when (attribute) {
             is PercentageAttribute -> (applyOperation(attribute.defaultValue, value) / base) - 1f
@@ -470,32 +663,28 @@ class GiftHandler(client: APClient) {
         }
     }
 
-    private fun effectsToTraits(effects: Iterable<MobEffectInstance>): List<GiftTrait> {
+    private fun effectsToTraits(effects: Iterable<MobEffectInstance>): List<GiftTraitHolder> {
         return effects.flatMap {
             convertToTrait(it.effect).map { n ->
                 GiftTrait(
-                    name = n,
-                    quality = it.amplifier.toFloat(),
-                    duration = potionDurationToTraitDuration(it.duration)
+                    name = n, quality = it.amplifier.toFloat(), duration = potionDurationToTraitDuration(it.duration)
                 )
             } + when (it.effect.value().category) {
                 MobEffectCategory.BENEFICIAL -> listOf(
                     KnownTraits.Buff.copy(
-                        quality = it.amplifier.toFloat(),
-                        duration = potionDurationToTraitDuration(it.duration)
+                        quality = it.amplifier.toFloat(), duration = potionDurationToTraitDuration(it.duration)
                     )
                 )
 
                 MobEffectCategory.HARMFUL -> listOf(
                     KnownTraits.Trap.copy(
-                        quality = it.amplifier.toFloat(),
-                        duration = potionDurationToTraitDuration(it.duration)
+                        quality = it.amplifier.toFloat(), duration = potionDurationToTraitDuration(it.duration)
                     )
                 )
 
                 MobEffectCategory.NEUTRAL -> emptyList()
             }
-        }
+        }.convert(GiftTraitSource.ITEM_COMPONENTS)
     }
 
     private fun convertToTrait(effect: Holder<MobEffect>): List<GiftTraitName> {
@@ -529,15 +718,11 @@ class GiftHandler(client: APClient) {
             MobEffects.UNLUCK -> listOf(KnownTraits.Unluck.name.name)
             MobEffects.SLOW_FALLING -> listOf("SlowFalling", KnownTraits.Flight.name.name)
             MobEffects.CONDUIT_POWER -> listOf(
-                KnownTraits.Ocean.name.name,
-                KnownTraits.Water.name.name,
-                "NightVision",
-                "WaterBreathing"
+                KnownTraits.Ocean.name.name, KnownTraits.Water.name.name, "NightVision", "WaterBreathing"
             )
 
             MobEffects.DOLPHINS_GRACE -> listOf(
-                KnownTraits.Ocean.name.name, KnownTraits.Water.name.name, "DolphinsGrace",
-                KnownTraits.Speed.name.name
+                KnownTraits.Ocean.name.name, KnownTraits.Water.name.name, "DolphinsGrace", KnownTraits.Speed.name.name
             )
 
             MobEffects.BAD_OMEN -> listOf(ExtraTraits.Ominous.name.name, KnownTraits.Trap.name.name)
@@ -548,9 +733,10 @@ class GiftHandler(client: APClient) {
 
     }
 
-    interface IsScope {
+    private interface IsScope {
         infix fun String.matches(trait: GiftTrait)
         fun String.matches(vararg traits: GiftTrait)
+        infix fun String.containingMeans(trait: GiftTrait)
 
         infix fun List<String>.matches(trait: GiftTrait) {
             this.forEach { t ->
@@ -570,37 +756,44 @@ class GiftHandler(client: APClient) {
 
 
     private fun splat(t: String): List<String> {
-        return t.split(':', '/', '_', '-')
+        return t.split(":")[1].split( '/', '_', '-')
     }
 
-    private inline fun match(t: String, block: IsScope.() -> Unit): List<GiftTrait> {
-        val res = mutableListOf<GiftTrait>()
+    private inline fun ConvertScope.match(t: String, block: IsScope.() -> Unit): List<GiftTraitHolder> {
+        val res = mutableListOf<GiftTraitHolder>()
         val obj = object : IsScope {
             override fun String.matches(trait: GiftTrait) {
                 assert(this.contains(':'))
                 if (this@matches == t) {
-                    res.add(trait)
+                    res.add(trait.convert())
                 }
             }
 
             override fun String.matches(vararg traits: GiftTrait) {
                 assert(this.contains(':'))
                 if (this@matches == t) {
-                    res.addAll(traits)
+                    res.addAll(traits.toList().convert())
+                }
+            }
+
+            override fun String.containingMeans(trait: GiftTrait) {
+                assert(!this.contains(':'))
+                if(t.split(":")[1].contains(this)){
+                    res.add(trait.convert())
                 }
             }
 
             override fun String.includes(trait: GiftTrait) {
                 assert(!this.contains(':'))
                 if (splat(t).contains(this@includes)) {
-                    res.add(trait)
+                    res.add(trait.convert())
                 }
             }
 
             override fun String.includes(vararg traits: GiftTrait) {
                 assert(!this.contains(':'))
                 if (splat(t).contains(this@includes)) {
-                    res.addAll(traits)
+                    res.addAll(traits.toList().convert())
                 }
             }
         }
@@ -608,125 +801,136 @@ class GiftHandler(client: APClient) {
         return res
     }
 
-    private fun commonTags(t: String): List<GiftTrait> = match(t) {
-        "c:stones" matches KnownTraits.Stone
-        "c:foods/vegetable" matches KnownTraits.Vegetable
-        "c:foods" matches KnownTraits.Food
-        "c:raw_materials" matches KnownTraits.Material
-        "c:drinks" matches KnownTraits.Drink
-        "c:woods" matches KnownTraits.Wood
-        "wooden" includes KnownTraits.Wood
-        listOf(
-            "c:grass", "c:grass_variants", "minecraft:leaves",
-            "c:flowers", "minecraft:dirt",
-            "minecraft:lush_plants_replaceable", "minecraft:replaceable_plants",
-            "c:crops", "c:seeds"
-        ) matches KnownTraits.Grass
-        "c:ores" matches KnownTraits.Ore
-        "c:eggs" matches KnownTraits.Egg
-        "c:foods/cooked_egg" matches KnownTraits.Egg
-        listOf("c:foods/cooked_fish", "c:foods/raw_fish") matches KnownTraits.Fish
-        "c:tools" matches KnownTraits.Tool
-        listOf(
-            "minecraft:enchantable/weapon", "c:tools/melee_weapons",
-            "c:tools/ranged_weapons"
-        ) matches KnownTraits.Weapon
-        "c:tools/melee_weapons" matches KnownTraits.MeleeWeapon
-        "c:tools/ranged_weapons" matches KnownTraits.RangedWeapon
-        listOf(
-            "c:buckets/entity_water", "c:foods/raw_fish",
-            "c:cooked_meat", "c:foods/raw_meat",
-        ) matches KnownTraits.Animal
-        "c:armors" matches KnownTraits.Armor
-        "c:foods/fruit" matches KnownTraits.Fruit
-        "copper" includes KnownTraits.Copper
-        "coal" includes KnownTraits.Coal
-        listOf("c:ingots", "minecraft:beacon_base_blocks") matches KnownTraits.Metal
-        listOf("c:foods/raw_meat", "c:foods/cooked_meat") matches KnownTraits.Meat
-        "gold" includes KnownTraits.Gold
-        "cooked" includes KnownTraits.Cooking
-        listOf("c:foods/cookie", "c:foods/soup") matches KnownTraits.Cooking
-        "c:netherracks" matches SpecificTraits.Nether
-        "nether" includes SpecificTraits.Nether
-        "minecraft:infiniburn_overworld" includes SpecificTraits.Nether
-        "c:rods/blaze" matches KnownTraits.Fire
-        "c:flowers" matches KnownTraits.Flower
-        "minecraft:planks" matches KnownTraits.Lumber
-        "minecraft:stripped_logs" matches KnownTraits.Lumber
-        "c:gems" matches KnownTraits.Gem
-        "c:stones" matches KnownTraits.Mineral
-        Items.SHULKER_BOX
-        "silver" includes KnownTraits.Silver
-        "coffee" includes KnownTraits.Coffee
-        "c:buckets/water" matches KnownTraits.Water
-        "c:drinks/watery" matches KnownTraits.Water
-        listOf(
-            "c:shulker_boxes", "c:chests", "c:barrels", "c:buckets"
-        ) matches KnownTraits.Container
+    private fun commonTags(t: String): List<GiftTraitHolder> = convertScope(GiftTraitSource.TAGS) {
+        if(t.contains("incorrect_for")
+            || splat(t).contains("needs")
+            || splat(t).contains("repleacables")
+            ) {
+            return@convertScope emptyList()
+        }
+        match(t) {
+            "c:stones" matches KnownTraits.Stone
+            "base_stone" containingMeans KnownTraits.Stone
+            "c:foods/vegetable" matches KnownTraits.Vegetable
+            "c:foods" matches KnownTraits.Food
+            "c:raw_materials" matches KnownTraits.Material
+            "c:drinks" matches KnownTraits.Drink
+            "c:woods" matches KnownTraits.Wood
+            "wooden" includes KnownTraits.Wood
+            listOf(
+                "c:grass",
+                "c:grass_variants",
+                "minecraft:leaves",
+                "c:flowers",
+                "minecraft:dirt",
+                "minecraft:lush_plants_replaceable",
+                "minecraft:replaceable_plants",
+                "c:crops",
+                "c:seeds"
+            ) matches KnownTraits.Grass
+            "c:ores" matches KnownTraits.Ore
+            "c:eggs" matches KnownTraits.Egg
+            "c:foods/cooked_egg" matches KnownTraits.Egg
+            listOf("c:foods/cooked_fish", "c:foods/raw_fish") matches KnownTraits.Fish
+            "c:tools" matches KnownTraits.Tool
+            listOf(
+                "minecraft:enchantable/weapon", "c:tools/melee_weapons", "c:tools/ranged_weapons"
+            ) matches KnownTraits.Weapon
+            "c:tools/melee_weapons" matches KnownTraits.MeleeWeapon
+            "c:tools/ranged_weapons" matches KnownTraits.RangedWeapon
+            listOf(
+                "c:buckets/entity_water", "c:foods/raw_fish",
+                "c:cooked_meat", "c:foods/raw_meat",
+            ) matches KnownTraits.Animal
+            "c:armors" matches KnownTraits.Armor
+            "c:foods/fruit" matches KnownTraits.Fruit
+            "copper" includes KnownTraits.Copper
+            "coal" includes KnownTraits.Coal
+            listOf("c:ingots", "minecraft:beacon_base_blocks") matches KnownTraits.Metal
+            listOf("c:foods/raw_meat", "c:foods/cooked_meat") matches KnownTraits.Meat
+            "gold" includes KnownTraits.Gold
+            "cooked" includes KnownTraits.Cooking
+            listOf("c:foods/cookie", "c:foods/soup") matches KnownTraits.Cooking
+            "c:netherracks" matches SpecificTraits.Nether
+            "nether" includes SpecificTraits.Nether
+            "netherrack" includes SpecificTraits.Nether
+            "c:rods/blaze" matches KnownTraits.Fire
+            "c:flowers" matches KnownTraits.Flower
+            "minecraft:planks" matches KnownTraits.Lumber
+            "minecraft:stripped_logs" matches KnownTraits.Lumber
+            "c:gems" matches KnownTraits.Gem
+            listOf("c:stones","c:obsidians") matches KnownTraits.Mineral
+            Items.SHULKER_BOX
+            "silver" includes KnownTraits.Silver
+            "coffee" includes KnownTraits.Coffee
+            "c:buckets/water" matches KnownTraits.Water
+            "c:drinks/watery" matches KnownTraits.Water
+            listOf(
+                "c:shulker_boxes", "c:chests", "c:barrels", "c:buckets"
+            ) matches KnownTraits.Container
 
-        listOf(
-            "minecraft:ice",
-            "minecraft:snow"
-        ) matches KnownTraits.Ice
-        "c:stones" matches KnownTraits.Rock
-        "boulder" includes KnownTraits.Boulder
-        "minecraft:bookshelf_books" matches KnownTraits.Book
-        "minecraft:bookshelf_books" matches KnownTraits.Paper
-        "c:seeds" matches KnownTraits.Seed
-        "c:cave_vines" matches KnownTraits.Vine
-        listOf("vine", "vines") includes KnownTraits.Vine
-        "c:dyes" matches KnownTraits.Dye
-        listOf("c:flower_pots", "minecraft:decorated_pot_sherds") matches KnownTraits.Ceramic
-        "c:villager_currencies" matches KnownTraits.Currency
-        "c:mushrooms" matches KnownTraits.Mushroom
-        "c:bones" matches KnownTraits.Bone
-        "iron" includes KnownTraits.Iron
-        "c:foods/berry" matches KnownTraits.Berry
-        listOf(
-            "c:villager_job_sites", "c:player_workstations/furnaces",
-            "c:player_workstations/crafting_tables"
-        ) matches KnownTraits.Machine
-        listOf("c:slime_balls", "c:storage_blocks/slime") matches KnownTraits.Goo
-        listOf(
-            "c:clusters", "c:buds",
-        ) matches KnownTraits.Crystal
-        listOf("amethyst", "quartz") includes KnownTraits.Crystal
-        listOf("c:foods/cooked_chicken", "c:foods/raw_chicken") matches KnownTraits.Chicken
-        "c:leathers" matches KnownTraits.Leather
-        "c:dusts/salt" matches KnownTraits.Salted
-        "platinum" includes KnownTraits.Platinum
-        "insect" includes KnownTraits.Insect
-        listOf("oil", "petrol", "petroleum") includes KnownTraits.Oil
-        "diamond" includes KnownTraits.Diamond
-        "c:drinks/juice" matches KnownTraits.Juice
-        "milk" includes KnownTraits.Milk
-        "milk" includes KnownTraits.AnimalProduct
-        listOf("torch", "glowstone") includes KnownTraits.Light
-        "c:potions" matches KnownTraits.Potion
-        "c:sands" matches KnownTraits.Sand
-        "c:sands" matches KnownTraits.Beach
-        "c:fertilizers" matches KnownTraits.Fertilizer
-        "c:fiber" matches KnownTraits.Fiber
-        "c:player_workstations/furnaces" matches KnownTraits.Furnace
-        "c:player_workstations/crafting_tables" matches KnownTraits.Crafting
-        "minecraft:saplings" matches KnownTraits.TreeSeed
-        "prismarine" includes KnownTraits.Water
-        "prismarine" includes KnownTraits.Ocean
-        "prismarine" includes KnownTraits.Prismarine
-        "prismarine" includes KnownTraits.Aquamarine
-        listOf("c:foods/cooked_beef", "c:foods/raw_beef", "c:milk", "c:milks") matches KnownTraits.Cow
-        listOf("c:foods/cooked_beef", "c:foods/raw_beef") matches KnownTraits.Beef
-        listOf("minecraft:logs", "minecraft:leaves", "minecraft:saplings") matches KnownTraits.Tree
-        listOf("c:sand", "c:cactus") matches KnownTraits.Desert
-        listOf("c:grain", "c:crops/grain") matches KnownTraits.Grain
+            listOf(
+                "minecraft:ice", "minecraft:snow"
+            ) matches KnownTraits.Ice
+            "c:stones" matches KnownTraits.Rock
+            "boulder" includes KnownTraits.Boulder
+            "minecraft:bookshelf_books" matches KnownTraits.Book
+            "minecraft:bookshelf_books" matches KnownTraits.Paper
+            "c:seeds" matches KnownTraits.Seed
+            "c:cave_vines" matches KnownTraits.Vine
+            listOf("vine", "vines") includes KnownTraits.Vine
+            "c:dyes" matches KnownTraits.Dye
+            listOf("c:flower_pots", "minecraft:decorated_pot_sherds") matches KnownTraits.Ceramic
+            "c:villager_currencies" matches KnownTraits.Currency
+            "c:mushrooms" matches KnownTraits.Mushroom
+            "c:bones" matches KnownTraits.Bone
+            "iron" includes KnownTraits.Iron
+            "c:foods/berry" matches KnownTraits.Berry
+            listOf(
+                "c:villager_job_sites", "c:player_workstations/furnaces", "c:player_workstations/crafting_tables"
+            ) matches KnownTraits.Machine
+            listOf("c:slime_balls", "c:storage_blocks/slime") matches KnownTraits.Goo
+            listOf(
+                "c:clusters", "c:buds",
+            ) matches KnownTraits.Crystal
+            listOf("amethyst", "quartz") includes KnownTraits.Crystal
+            listOf("c:foods/cooked_chicken", "c:foods/raw_chicken") matches KnownTraits.Chicken
+            "c:leathers" matches KnownTraits.Leather
+            "c:dusts/salt" matches KnownTraits.Salted
+            "platinum" includes KnownTraits.Platinum
+            "insect" includes KnownTraits.Insect
+            listOf("oil", "petrol", "petroleum") includes KnownTraits.Oil
+            "diamond" includes KnownTraits.Diamond
+            "c:drinks/juice" matches KnownTraits.Juice
+            "milk" includes KnownTraits.Milk
+            "milk" includes KnownTraits.AnimalProduct
+            listOf("torch", "glowstone") includes KnownTraits.Light
+            "c:potions" matches KnownTraits.Potion
+            "c:sands" matches KnownTraits.Sand
+            "c:sands" matches KnownTraits.Beach
+            "c:fertilizers" matches KnownTraits.Fertilizer
+            "c:fiber" matches KnownTraits.Fiber
+            "c:player_workstations/furnaces" matches KnownTraits.Furnace
+            "c:player_workstations/crafting_tables" matches KnownTraits.Crafting
+            "minecraft:saplings" matches KnownTraits.TreeSeed
+            "prismarine" includes KnownTraits.Water
+            "prismarine" includes KnownTraits.Ocean
+            "prismarine" includes KnownTraits.Prismarine
+            "prismarine" includes KnownTraits.Aquamarine
+            listOf("c:foods/cooked_beef", "c:foods/raw_beef", "c:milk", "c:milks") matches KnownTraits.Cow
+            listOf("c:foods/cooked_beef", "c:foods/raw_beef") matches KnownTraits.Beef
+            listOf("minecraft:logs", "minecraft:leaves", "minecraft:saplings") matches KnownTraits.Tree
+            listOf("c:sand", "c:cactus") matches KnownTraits.Desert
+            listOf("c:grain", "c:crops/grain") matches KnownTraits.Grain
 
 
 
 
-        "c:gunpowders" matches KnownTraits.Explosive
-        "c:dusts" matches KnownTraits.Powder
-        diesAndDied()
+            "c:gunpowders" matches KnownTraits.Explosive
+            "c:dusts" matches KnownTraits.Powder
+            diesAndDied()
 
+        }
     }
 
     private fun IsScope.diesAndDied() {
@@ -749,11 +953,11 @@ class GiftHandler(client: APClient) {
 
     }
 
-    private fun blockTagsToTraits(tag: TagKey<Block>): List<GiftTrait> {
+    private fun blockTagsToTraits(tag: TagKey<Block>): List<GiftTraitHolder> {
         return commonTags(tag.location.toString()) + emptyList()
     }
 
-    private fun itemTagsToTraits(tag: TagKey<Item>): List<GiftTrait> {
+    private fun itemTagsToTraits(tag: TagKey<Item>): List<GiftTraitHolder> {
         return commonTags(tag.location.toString()) + emptyList()
     }
 
@@ -762,11 +966,9 @@ class GiftHandler(client: APClient) {
         println("Closest item found: $closest")
         val itm = closest.getOrNull(0)?.copyWithCount(amount) ?: return null
         val durableTraits = traits.filter {
-            it.name == KnownTraits.Tool.name ||
-                    it.name == KnownTraits.Weapon.name ||
-                    it.name == KnownTraits.Armor.name
+            destinationTraits.isMember(it)
         }
-        if(durableTraits.isNotEmpty() && itm.isDamageableItem) {
+        if (durableTraits.isNotEmpty() && itm.isDamageableItem) {
             // set the damage value based on the average durability and the quality of the traits
             val averageDurability = durableTraits.map { it.duration }.average().toInt()
             itm.damageValue = (averageDurability * itm.maxDamage).toInt()
@@ -778,17 +980,205 @@ class GiftHandler(client: APClient) {
 
 
 fun potionDurationToTraitDuration(duration: Int): Float {
-    return if (duration < 0) -1f else (duration.toFloat() / 20f) * 0.3514f
+    return if (duration < 0) -1f else (duration.toFloat() / 20f) / 180f // 3 min is standard potion duration
 }
 
+private fun List<GiftTrait>.isMember(trait: GiftTrait): Boolean {
+    return this.any { it.name == trait.name }
+}
+
+private fun List<GiftTrait>.isMember(trait: GiftTraitHolder): Boolean {
+    return this.any { it.name == trait.name }
+}
+
+
+private interface ConvertScope {
+    fun GiftTrait.convert(): GiftTraitHolder
+    fun List<GiftTrait>.convert(): List<GiftTraitHolder> {
+        return this.map { it.convert() }
+    }
+
+    operator fun List<GiftTrait>.plus(holder: GiftTraitHolder): List<GiftTraitHolder> {
+        val map: List<GiftTraitHolder> = this.map { it.convert() }
+        return map + holder
+    }
+
+    operator fun List<GiftTrait>.plus(holder: List<GiftTraitHolder>): List<GiftTraitHolder> {
+        val map: List<GiftTraitHolder> = this.map { it.convert() }
+        return map + holder
+    }
+}
+
+private inline fun <T> convertScope(source: GiftTraitSource, block: ConvertScope.() -> T): T {
+    val obj = object : ConvertScope {
+        override fun GiftTrait.convert(): GiftTraitHolder {
+            return GiftTraitHolder(
+                trait = this, source = source
+            )
+        }
+    }
+    return obj.block()
+}
+
+private val weaponTraits = listOf(
+    KnownTraits.Weapon,
+    KnownTraits.MeleeWeapon,
+    KnownTraits.RangedWeapon,
+)
+
+private val objectWithUsage = listOf(
+    KnownTraits.Tool,
+    KnownTraits.Weapon,
+    KnownTraits.MeleeWeapon,
+    KnownTraits.RangedWeapon,
+    KnownTraits.Armor,
+    ExtraTraits.Saddle,
+)
+
+// duration = durability
+private val destinationTraits = listOf(
+    KnownTraits.Consumable,
+    KnownTraits.Tool,
+    KnownTraits.Weapon,
+    KnownTraits.MeleeWeapon,
+    KnownTraits.RangedWeapon,
+    KnownTraits.Armor,
+    ExtraTraits.Saddle,
+    KnownTraits.Throwing
+)
+
+private val effectTraits = listOf(
+    KnownTraits.Buff,
+    KnownTraits.Trap,
+    KnownTraits.Heal,
+    KnownTraits.Mana,
+    KnownTraits.Cure,
+    KnownTraits.Slowness,
+    KnownTraits.Damage,
+    KnownTraits.Fire,
+    KnownTraits.Ice,
+    ExtraTraits.AttackSpeed,
+    ExtraTraits.Suspicious,
+    ExtraTraits.Ominous,
+    KnownTraits.Fertilizer
+)
+
+private val physicalStateTraits = listOf(
+    KnownTraits.Goo,
+    KnownTraits.Powder,
+)
+
+// inherited by crafting recipes
+private val craftingInheritedTraits = listOf(
+    KnownTraits.Resource,
+    KnownTraits.Book,
+    KnownTraits.Wood,
+    KnownTraits.Stone,
+    KnownTraits.Meat,
+    KnownTraits.Vegetable,
+    KnownTraits.Fruit,
+    KnownTraits.Egg,
+    KnownTraits.Metal,
+    KnownTraits.Mineral,
+    KnownTraits.Gem,
+    KnownTraits.Crystal,
+    KnownTraits.Rock,
+    KnownTraits.Paper,
+    KnownTraits.Fish,
+    KnownTraits.Mushroom,
+    KnownTraits.Copper,
+    KnownTraits.Coal,
+    KnownTraits.Gold,
+    KnownTraits.Silver,
+    KnownTraits.Platinum,
+    KnownTraits.Diamond,
+    KnownTraits.Prismarine,
+    KnownTraits.Aquamarine,
+    KnownTraits.Sand,
+    KnownTraits.Bone,
+    KnownTraits.Clay,
+    KnownTraits.Iron,
+    KnownTraits.Ceramic,
+    KnownTraits.Teleport,
+    KnownTraits.Fire,
+    KnownTraits.Ice,
+    KnownTraits.Container,
+    KnownTraits.LiquidContainer,
+    KnownTraits.Energy,
+    KnownTraits.Electronics,
+    KnownTraits.Leather,
+    KnownTraits.AnimalProduct,
+    KnownTraits.Explosive,
+
+    )
+// inherited by crafting recipes
+private val compositionTraits = listOf(
+    KnownTraits.Resource,
+    KnownTraits.Wood,
+    KnownTraits.Stone,
+    KnownTraits.Ore,
+    KnownTraits.Grass,
+    KnownTraits.Meat,
+    KnownTraits.Vegetable,
+    KnownTraits.Fruit,
+    KnownTraits.Egg,
+    KnownTraits.Metal,
+    KnownTraits.Mineral,
+    KnownTraits.Gem,
+    KnownTraits.Crystal,
+    KnownTraits.Rock,
+    KnownTraits.Boulder,
+    KnownTraits.Paper,
+    KnownTraits.Fish,
+    KnownTraits.Fiber,
+    KnownTraits.Seed,
+    KnownTraits.Mushroom,
+    KnownTraits.Bush,
+    KnownTraits.Copper,
+    KnownTraits.Coal,
+    KnownTraits.Gold,
+    KnownTraits.Silver,
+    KnownTraits.Platinum,
+    KnownTraits.Diamond,
+    KnownTraits.Prismarine,
+    KnownTraits.Aquamarine,
+    KnownTraits.Sand,
+    KnownTraits.Fertilizer,
+    KnownTraits.Grain,
+    KnownTraits.Bone,
+    KnownTraits.Clay,
+    KnownTraits.Iron,
+    KnownTraits.Ceramic,
+    KnownTraits.Tree,
+    KnownTraits.TreeSeed,
+    KnownTraits.Mineral,
+    KnownTraits.Flower,
+    KnownTraits.Teleport,
+    KnownTraits.Fire,
+    KnownTraits.Ice,
+    KnownTraits.Container,
+    KnownTraits.LiquidContainer,
+    KnownTraits.Energy,
+    KnownTraits.Electronics,
+    KnownTraits.Salted,
+    KnownTraits.Cooking,
+    KnownTraits.Leather,
+    KnownTraits.AnimalProduct,
+    KnownTraits.Explosive,
+
+    )
+
 object ExtraTraits {
+    val ArmorToughness: GiftTrait = GiftTrait(GiftTraitName("ArmorToughness"))
     val AttackSpeed = GiftTrait(GiftTraitName("AttackSpeed"))
     val Saddle = GiftTrait(GiftTraitName("Saddle"))
     val Suspicious = GiftTrait(GiftTraitName("Suspicious"))
     val Ominous = GiftTrait(GiftTraitName("Ominous"))
 }
 
+
 object KnownTraits {
+
     val Speed = GiftTrait(GiftTraitName("Speed"))
     val Consumable = GiftTrait(GiftTraitName("Consumable"))
     val Food = GiftTrait(GiftTraitName("Food"))

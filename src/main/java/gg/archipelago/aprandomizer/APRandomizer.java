@@ -213,6 +213,15 @@ public class APRandomizer {
         return giftHandler;
     }
 
+    public static void tryEnableGifting() {
+        if(APClient == null || !APClient.isConnected() || giftHandler != null) {
+            return;
+        }
+        giftHandler = new GiftHandler(APClient);
+        giftHandler.openGiftBox();
+        giftHandler.startReception();
+    }
+
     @SubscribeEvent
     public void onServerAboutToStart(ServerAboutToStartEvent event) {
         if (apmcData.state != APMCData.State.VALID) {

@@ -106,8 +106,7 @@ object StartCommand {
                 }
             }
             itemManager.catchUp(server)
-            APRandomizer.getGiftHandler().openGiftBox()
-            APRandomizer.giftHandler.startReception()
+            APRandomizer.tryEnableGifting()
         })
         return 1
     }

@@ -29,7 +29,7 @@ allprojects {
             }
         }
         mavenCentral()
-        mavenLocal()
+        maven { url = uri("https://jitpack.io") }
         // REQUIRED for using Kotlin for Forge
         maven {
             name = 'Kotlin for Forge'
