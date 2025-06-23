@@ -80,21 +80,21 @@ object GiftCommand {
         // Check if the item can be sent
         val giftHandler = APRandomizer.getGiftHandler()
 
-        //todo debug
-//        giftHandler.giftItem(heldItem, recipient).whenComplete { giftingError,v ->
-//            commandSourceCommandContext.getSource()!!
-//                .sendFailure(Component.literal("Error while gifting item: " + giftingError))
-//            player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY) // Clear the item from the player's hand
-//        }
-        commandSourceCommandContext.source!!.sendSuccess(
-            {
-                Component.literal(
-                    "Item traits : " + giftHandler.getGiftItem(heldItem).toString()
-                )
-            }, true
+        commandSourceCommandContext.source!!.sendSystemMessage(
+            Component.literal(
+                "Item traits : " + giftHandler.getGiftItem(heldItem).toString()
+            )
         )
+        giftHandler.giftItem(heldItem, recipient).whenComplete { giftingError, v ->
+            if (giftingError != null) {
+                commandSourceCommandContext.getSource()!!
+                    .sendFailure(Component.literal("Error while gifting item: " + giftingError))
+            } else
+                player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY) // Clear the item from the player's hand
+        }
 
-        return 0;
+
+        return 1;
     }
 
     //wait for register commands event then register us as a command.
